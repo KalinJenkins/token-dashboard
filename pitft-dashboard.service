@@ -1,0 +1,21 @@
+[Unit]
+Description=PiTFT API Credit Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pitft-dashboard
+ExecStart=/home/pi/pitft-dashboard/venv/bin/python /home/pi/pitft-dashboard/dashboard.py
+Restart=on-failure
+RestartSec=10
+# SDL needs to know about the framebuffer
+Environment=SDL_FBDEV=/dev/fb1
+Environment=SDL_VIDEODRIVER=fbcon
+Environment=SDL_MOUSEDRV=TSLIB
+Environment=SDL_MOUSEDEV=/dev/input/touchscreen
+Environment=DISPLAY=
+
+[Install]
+WantedBy=multi-user.target

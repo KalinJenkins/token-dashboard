@@ -1,0 +1,4 @@
+pygame==2.5.2
+RPi.GPIO==0.7.1
+requests==2.31.0
+python-dotenv==1.0.1
