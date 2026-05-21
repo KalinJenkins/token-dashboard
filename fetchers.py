@@ -1,8 +1,12 @@
 """
-fetchers.py – pulls balance/usage data from each service API.
+fetchers.py
 
-Each fetcher returns a dict.  On error it returns {"error": "<msg>"}.
-fetch_all() merges them under service keys.
+Anthropic:  pings /v1/models with a regular API key to verify liveness and
+            capture live rate-limit headers (requests & tokens remaining).
+            Credit balance is static from .env — updated manually after top-ups.
+
+ElevenLabs: hits the documented /v1/user/subscription endpoint for live
+            character usage, limit, tier, reset date, and overage.
 """
 
 import os
@@ -12,18 +16,13 @@ from datetime import datetime
 import requests
 
 log = logging.getLogger(__name__)
+TIMEOUT = 10
 
-TIMEOUT = 10  # seconds per request
 
-# ── Anthropic API ─────────────────────────────────────────────────────────────
+# ── Anthropic ─────────────────────────────────────────────────────────────────
 
 def fetch_anthropic() -> dict:
-    """
-    Retrieves credit balance and usage from the Anthropic Console API.
-    Requires ANTHROPIC_ADMIN_KEY (an Anthropic Console/Admin key, NOT a regular
-    API key – generate one at console.anthropic.com → Settings → API keys).
-    """
-    key = os.getenv("ANTHROPIC_ADMIN_KEY", "").strip()
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key:
         return {"error": "no key"}
 
@@ -34,133 +33,49 @@ def fetch_anthropic() -> dict:
 
     result: dict = {}
 
-    # --- Credit balance --------------------------------------------------
+    # Ping /v1/models — cheap, no tokens consumed, exposes rate-limit headers
     try:
         r = requests.get(
-            "https://api.anthropic.com/v1/organizations/credits/balance",
+            "https://api.anthropic.com/v1/models",
             headers=headers,
             timeout=TIMEOUT,
         )
+
         if r.status_code == 200:
-            data = r.json()
-            # Balance is returned in micro-dollars; convert to dollars
-            raw = data.get("balance_microdollars") or data.get("balance") or 0
-            if raw > 1_000:      # micro-dollars
-                result["credit_balance"] = raw / 1_000_000
-            else:                # assume already dollars
-                result["credit_balance"] = float(raw)
-        else:
-            log.warning(f"Anthropic balance: {r.status_code} {r.text[:120]}")
-            result["error"] = f"HTTP {r.status_code}"
-    except Exception as e:
-        log.error(f"Anthropic balance fetch: {e}")
-        result["error"] = str(e)[:40]
-
-    # --- Usage (current month) -------------------------------------------
-    try:
-        now = datetime.utcnow()
-        params = {
-            "start_time": now.replace(day=1, hour=0, minute=0, second=0).isoformat() + "Z",
-        }
-        r = requests.get(
-            "https://api.anthropic.com/v1/organizations/usage",
-            headers=headers,
-            params=params,
-            timeout=TIMEOUT,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            raw = data.get("total_cost_microdollars") or data.get("total_cost") or 0
-            if raw > 1_000:
-                result["monthly_usage"] = raw / 1_000_000
-            else:
-                result["monthly_usage"] = float(raw)
-        # Silently ignore if this endpoint isn't available on the plan
-    except Exception as e:
-        log.warning(f"Anthropic usage fetch: {e}")
-
-    # --- Tier / plan info ------------------------------------------------
-    try:
-        r = requests.get(
-            "https://api.anthropic.com/v1/organizations",
-            headers=headers,
-            timeout=TIMEOUT,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            result["tier"] = data.get("tier") or data.get("plan") or "—"
-    except Exception:
-        pass
-
-    return result
-
-
-# ── Claude.ai (Unofficial – session cookie) ───────────────────────────────────
-
-def fetch_claude_ai() -> dict:
-    """
-    Claude.ai does not have an official public API for quota data.
-    This fetcher uses the internal /api/account endpoint with your session cookie.
-    Set CLAUDE_SESSION_KEY in .env to your __session cookie value from claude.ai.
-
-    To get it:
-      1. Log into claude.ai in Chrome/Firefox
-      2. Open DevTools → Application → Cookies → https://claude.ai
-      3. Copy the value of the '__session' cookie
-    """
-    session_key = os.getenv("CLAUDE_SESSION_KEY", "").strip()
-    if not session_key:
-        return {"error": "no session key", "plan": "—"}
-
-    headers = {
-        "Cookie": f"__session={session_key}",
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-        "Referer": "https://claude.ai/",
-    }
-
-    result: dict = {}
-
-    try:
-        r = requests.get(
-            "https://claude.ai/api/account",
-            headers=headers,
-            timeout=TIMEOUT,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            result["plan"] = (
-                data.get("active_subscription", {}).get("plan_name")
-                or data.get("billing_plan")
-                or "Free"
-            )
+            result["key_valid"] = True
         elif r.status_code == 401:
-            return {"error": "session expired", "plan": "—"}
+            return {"error": "invalid key", "key_valid": False}
         else:
-            return {"error": f"HTTP {r.status_code}", "plan": "—"}
-    except Exception as e:
-        return {"error": str(e)[:40], "plan": "—"}
+            result["key_valid"] = False
+            result["error"] = f"HTTP {r.status_code}"
 
-    # Usage / limits
-    try:
-        r = requests.get(
-            "https://claude.ai/api/account/usage",
-            headers=headers,
-            timeout=TIMEOUT,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            result["messages_used"]  = data.get("message_count") or data.get("messages_used")
-            result["messages_limit"] = data.get("message_limit") or data.get("messages_limit")
-            reset_at = data.get("reset_at") or data.get("resets_at")
-            if reset_at:
-                # Trim to just the date part if it's a full ISO timestamp
-                result["resets_at"] = reset_at[:10]
-    except Exception:
-        pass
+        # Rate-limit headers are present on every response, valid or not
+        def _int(h):
+            v = r.headers.get(h)
+            return int(v) if v and v.isdigit() else None
+
+        result["req_limit"]     = _int("anthropic-ratelimit-requests-limit")
+        result["req_remaining"] = _int("anthropic-ratelimit-requests-remaining")
+        result["tok_limit"]     = _int("anthropic-ratelimit-tokens-limit")
+        result["tok_remaining"] = _int("anthropic-ratelimit-tokens-remaining")
+
+        # Reset times (ISO strings)
+        result["req_reset"] = r.headers.get("anthropic-ratelimit-requests-reset")
+        result["tok_reset"] = r.headers.get("anthropic-ratelimit-tokens-reset")
+
+    except requests.RequestException as e:
+        log.error(f"Anthropic fetch: {e}")
+        return {"error": str(e)[:40], "key_valid": False}
+
+    # Static values from .env — updated manually after Console top-ups
+    balance_raw = os.getenv("ANTHROPIC_CREDIT_BALANCE", "").strip()
+    if balance_raw:
+        try:
+            result["credit_balance"] = float(balance_raw)
+        except ValueError:
+            log.warning("ANTHROPIC_CREDIT_BALANCE is not a valid number")
+
+    result["tier"] = os.getenv("ANTHROPIC_TIER", "").strip() or "—"
 
     return result
 
@@ -168,42 +83,45 @@ def fetch_claude_ai() -> dict:
 # ── ElevenLabs ────────────────────────────────────────────────────────────────
 
 def fetch_elevenlabs() -> dict:
-    """
-    Uses the ElevenLabs API to retrieve character usage quota.
-    Set ELEVENLABS_API_KEY in .env.
-    """
     key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if not key:
         return {"error": "no key"}
 
-    headers = {
-        "xi-api-key": key,
-        "Accept": "application/json",
-    }
-
-    result: dict = {}
-
     try:
         r = requests.get(
-            "https://api.elevenlabs.io/v1/user",
-            headers=headers,
+            "https://api.elevenlabs.io/v1/user/subscription",
+            headers={"xi-api-key": key, "Accept": "application/json"},
             timeout=TIMEOUT,
         )
-        if r.status_code == 200:
-            data = r.json()
-            sub = data.get("subscription", {})
-            result["tier"]        = sub.get("tier") or sub.get("plan") or "—"
-            result["chars_used"]  = sub.get("character_count")
-            result["chars_limit"] = sub.get("character_limit")
-            reset_ts = sub.get("next_character_count_reset_unix")
-            if reset_ts:
-                result["next_reset"] = datetime.utcfromtimestamp(reset_ts).strftime("%Y-%m-%d")
-        elif r.status_code == 401:
-            return {"error": "invalid key"}
-        else:
-            return {"error": f"HTTP {r.status_code}"}
-    except Exception as e:
+    except requests.RequestException as e:
         return {"error": str(e)[:40]}
+
+    if r.status_code == 401:
+        return {"error": "invalid key"}
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code}"}
+
+    d = r.json()
+
+    result: dict = {
+        "tier":        d.get("tier", "—"),
+        "status":      d.get("status", "—"),
+        "chars_used":  d.get("character_count"),
+        "chars_limit": d.get("character_limit"),
+    }
+
+    reset_unix = d.get("next_character_count_reset_unix")
+    if reset_unix:
+        result["next_reset"] = datetime.utcfromtimestamp(reset_unix).strftime("%b %d")
+
+    overage = d.get("current_overage", {})
+    try:
+        amt = float(overage.get("amount", 0))
+        if amt > 0:
+            result["overage"] = amt
+            result["overage_currency"] = overage.get("currency", "usd").upper()
+    except (ValueError, TypeError):
+        pass
 
     return result
 
@@ -212,13 +130,7 @@ def fetch_elevenlabs() -> dict:
 
 def fetch_all() -> dict:
     log.info("Fetching Anthropic…")
-    anthropic = fetch_anthropic()
-    log.info("Fetching Claude.ai…")
-    claude_ai = fetch_claude_ai()
+    anthropic  = fetch_anthropic()
     log.info("Fetching ElevenLabs…")
     elevenlabs = fetch_elevenlabs()
-    return {
-        "anthropic":  anthropic,
-        "claude_ai":  claude_ai,
-        "elevenlabs": elevenlabs,
-    }
+    return {"anthropic": anthropic, "elevenlabs": elevenlabs}
