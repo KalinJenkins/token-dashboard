@@ -3,7 +3,8 @@
 A Raspberry Pi dashboard showing live **Anthropic API** and **ElevenLabs**
 account status on an Adafruit 2.8" PiTFT (320×240) hat.
 
-![Dashboard running on the PiTFT](device.jpg)
+<img src="device.jpg" width="400">
+
 
 ---
 
