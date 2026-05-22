@@ -3,48 +3,30 @@
 A Raspberry Pi dashboard showing live **Anthropic API** and **ElevenLabs**
 account status on an Adafruit 2.8" PiTFT (320×240) hat.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  API DASHBOARD                                      upd 14:22   │
-├──────────────────────────────┬──────────────────────────────────┤
-│  ◈  ANTHROPIC                │  ◎  ELEVENLABS                   │
-│  ● key  active               │  ● active                        │
-│                              │                                  │
-│  Credit Balance              │  Characters                      │
-│  $14.23                      │  82K                             │
-│                              │  remaining of 100K               │
-│  ───────────────────         │  ████████░░  82%                 │
-│  Req / min    45/50          │  used 18K (18%)                  │
-│  ████████░░                  │                                  │
-│  Tok / min  42K/50K          │  ───────────────────             │
-│  ████████░░                  │  Plan      Creator               │
-│  Tier         Build          │  Resets    Jun 01                │
-└──────────────────────────────┴──────────────────────────────────┘
-│  [1] Refresh                                   [4] Backlight    │
-└─────────────────────────────────────────────────────────────────┘
-```
+![Dashboard running on the PiTFT](device.jpg)
 
-## What's live vs static
+---
 
-| Field | Source |
-|---|---|
-| Anthropic key valid/invalid | Live — pinged on every refresh |
-| Anthropic requests remaining / limit | Live — from API response headers |
-| Anthropic tokens remaining / limit | Live — from API response headers |
-| Anthropic credit balance | **Static** — set in `.env`, update after top-ups |
-| Anthropic tier | **Static** — set in `.env` |
-| ElevenLabs everything | Live — official `/v1/user/subscription` endpoint |
+## What's displayed
 
-The Anthropic balance being static is a platform limitation — live billing
-data requires an Admin API key that Anthropic only issues to org-level
-accounts. The rate-limit headers are the genuinely useful live signal anyway:
-they tell you how much headroom you have right now.
+### Anthropic
+- Live key status (green/red dot)
+- Requests remaining vs limit (per minute) + progress bar
+- Tokens remaining vs limit (per minute) + progress bar
+
+### ElevenLabs
+- Account status (active/inactive)
+- Characters remaining + progress bar
+- Plan tier and next reset date
+- Overage if applicable
+
+All data refreshes automatically every 5 minutes. Press **Button 1** to refresh immediately.
 
 ---
 
 ## Hardware
 
-- Raspberry Pi (any model with 40-pin GPIO)
+- Raspberry Pi 3 B+ (or any Pi with 40-pin GPIO and built-in WiFi)
 - [Adafruit PiTFT 2.8" 320×240 + Resistive Touchscreen Hat](https://www.adafruit.com/product/2298)
 
 **Button mapping (left → right on the hat):**
@@ -58,68 +40,98 @@ they tell you how much headroom you have right now.
 
 ---
 
+## How it works
+
+Renders directly to `/dev/fb0` using Pillow — no SDL, no X11, no display
+manager required. Works from a bare console with auto-login on tty1.
+
+---
+
 ## Setup
 
 ### 1. Install PiTFT drivers
 
-Follow Adafruit's guide to get the framebuffer working first:
-https://learn.adafruit.com/adafruit-pitft-28-inch-resistive-touchscreen-display-raspberry-pi
+```bash
+git clone https://github.com/adafruit/Raspberry-Pi-Installer-Scripts.git
+cd Raspberry-Pi-Installer-Scripts
+sudo pip3 install adafruit-python-shell --break-system-packages
+sudo python3 adafruit-pitft.py
+```
 
-Run their installer and choose **Console** mode (framebuffer, no X11 needed).
-Confirm `/dev/fb1` exists before continuing.
+Choose **PiTFT 2.4", 2.8" or 3.2" resistive**, **90 degrees (landscape)**, **Display console on PiTFT**. Reboot when prompted.
 
-### 2. Clone the repo
+### 2. Disable desktop (if running)
+
+```bash
+sudo systemctl disable display-manager
+sudo reboot
+```
+
+### 3. Set up auto-login
+
+```bash
+sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+sudo nano /etc/systemd/system/getty@tty1.service.d/autologin.conf
+```
+
+Paste:
+```
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin YOUR_USERNAME --noclear %I $TERM
+```
+
+### 4. Clone the repo
 
 ```bash
 git clone https://github.com/KalinJenkins/token-dashboard.git
 cd token-dashboard
 ```
 
-### 3. Configure .env
+### 5. Configure .env
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Fill in the three required values — see **API Keys** below for where to find each.
-
-### 4. Create venv and install dependencies
+### 6. Create venv and install dependencies
 
 ```bash
-python3 -m venv venv
+python3 -m venv venv --system-site-packages
 source venv/bin/activate
-pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-> `RPi.GPIO` only installs on a Raspberry Pi. On a dev machine, comment it
-> out of `requirements.txt` and stub it, or test directly on the Pi.
-
-### 5. Run
+### 7. Auto-launch on login
 
 ```bash
-source venv/bin/activate
-python dashboard.py
+nano ~/.bash_profile
 ```
 
-- **Button 1** (GPIO 17) — refresh immediately
-- **Button 4** (GPIO 27) — toggle backlight
-- On desktop: **R** to refresh, **Q** to quit
+Add:
+```bash
+if [ "$(tty)" = "/dev/tty1" ]; then
+    export SDL_VIDEODRIVER=fbcon
+    export SDL_FBDEV=/dev/fb0
+    export SDL_MOUSEDRV=TSLIB
+    export SDL_MOUSEDEV=/dev/input/touchscreen
+    cd ~/token-dashboard
+    source venv/bin/activate
+    python dashboard.py
+fi
+```
+
+Reboot — the dashboard launches automatically.
 
 ---
 
-## Autostart on boot
+## WiFi setup
 
 ```bash
-# Edit the service file if your username isn't 'pi'
-sudo cp pitft-dashboard.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable pitft-dashboard
-sudo systemctl start pitft-dashboard
-
-# Check logs
-sudo journalctl -u pitft-dashboard -f
+rfkill unblock wifi
+sudo nmcli con add type wifi ssid "Your Network" -- wifi-sec.key-mgmt wpa-psk wifi-sec.psk "your_password"
+sudo nmcli con up wifi
 ```
 
 ---
@@ -127,19 +139,12 @@ sudo journalctl -u pitft-dashboard -f
 ## API Keys
 
 ### Anthropic API Key
-- Go to **console.anthropic.com** → Settings → API Keys
-- Use any existing key, or create a new one
-- It only needs to be valid — the dashboard pings `/v1/models` to check
-  liveness and read rate-limit headers, which costs nothing
-
-### Anthropic Credit Balance
-- Check **console.anthropic.com** → Settings → Billing
-- Copy the balance into `ANTHROPIC_CREDIT_BALANCE` in `.env`
-- Update it manually after topping up (typically once a month)
+- **console.anthropic.com** → Settings → API Keys → Create key
+- Any regular key works — the dashboard reads rate-limit headers from API responses
 
 ### ElevenLabs API Key
-- Go to **elevenlabs.io** → click your avatar → Profile + API key
-- Copy the key into `ELEVENLABS_API_KEY` in `.env`
+- **elevenlabs.io** → avatar → Settings → Developers → API Keys
+- Create a restricted key with **User: Read** access only
 
 ---
 
@@ -148,13 +153,10 @@ sudo journalctl -u pitft-dashboard -f
 ```bash
 # Required
 ANTHROPIC_API_KEY=sk-ant-api03-…
-ANTHROPIC_CREDIT_BALANCE=14.23      # dollars, update after top-ups
-ANTHROPIC_TIER=Build                # shown in Console
-
 ELEVENLABS_API_KEY=…
 
 # Optional
-REFRESH_INTERVAL_SECONDS=300        # default: 300 (5 minutes)
+REFRESH_INTERVAL_SECONDS=300    # default: 300 (5 minutes)
 ```
 
 ---
@@ -163,12 +165,13 @@ REFRESH_INTERVAL_SECONDS=300        # default: 300 (5 minutes)
 
 ```
 token-dashboard/
-├── dashboard.py              # Main loop, GPIO, pygame rendering
-├── fetchers.py               # API fetchers (Anthropic + ElevenLabs)
+├── dashboard.py          # Main loop, GPIO, Pillow framebuffer renderer
+├── fetchers.py           # API fetchers (Anthropic + ElevenLabs)
 ├── requirements.txt
-├── .env.example              # Template — copy to .env, never commit .env
-├── .gitignore                # .env is excluded
-├── pitft-dashboard.service   # systemd unit for autostart
+├── .env.example          # Template — copy to .env, never commit .env
+├── .gitignore
+├── pitft-dashboard.service   # systemd unit (optional, not used)
+├── device.jpg            # Photo of the running dashboard
 └── README.md
 ```
 
@@ -176,18 +179,17 @@ token-dashboard/
 
 ## Troubleshooting
 
-**Black screen**
-Confirm `/dev/fb1` exists. The PiTFT driver must be installed first.
-Check `SDL_FBDEV` is set to `/dev/fb1` in the service file.
+**Black screen after boot**
+Confirm `/dev/fb0` exists: `ls /dev/fb*`. The PiTFT driver must be installed first.
 
-**`RPi.GPIO` import error**
-Expected on non-Pi machines. Install `mock-rpi-gpio` for local dev,
-or test directly on the Pi.
+**Dashboard doesn't launch on boot**
+Check `~/.bash_profile` exists and the `tty1` block is correct.
 
-**Anthropic shows rate limit as `—`**
-The rate-limit headers only appear when the API responds. If the key is
-invalid you'll see a red dot and no limit data.
+**Anthropic shows `—` for rate limits**
+The rate-limit headers only appear when the API responds successfully. Check `ANTHROPIC_API_KEY` in `.env`.
 
 **ElevenLabs shows an error**
-Double-check `ELEVENLABS_API_KEY` in `.env`. A 401 means the key is wrong
-or expired — generate a fresh one from your ElevenLabs profile page.
+Check `ELEVENLABS_API_KEY` in `.env`. A 401 means the key is wrong or expired.
+
+**WiFi not connecting after reboot**
+Run `nmcli dev status` — if wlan0 shows unavailable, try `rfkill unblock wifi` then `sudo systemctl restart NetworkManager`.
