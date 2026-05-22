@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PiTFT API Credit Dashboard  –  Anthropic + ElevenLabs
-320×240  Adafruit 2.8" PiTFT hat
+PiTFT API Credit Dashboard — Pillow/framebuffer renderer
+Draws directly to /dev/fb0, no SDL/pygame required.
 
 Button mapping (BCM GPIO, active-low):
   GPIO 17  Button 1 (leftmost)  → Refresh now
@@ -13,12 +13,13 @@ Button mapping (BCM GPIO, active-low):
 import os
 import sys
 import time
+import struct
 import threading
 import logging
 from datetime import datetime
 
-import pygame
 import RPi.GPIO as GPIO
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 from fetchers import fetch_all
@@ -27,8 +28,9 @@ from fetchers import fetch_all
 load_dotenv()
 
 REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL_SECONDS", 300))
-W, H = 320, 240
-FPS  = 10
+W, H      = 320, 240
+FB_DEV    = os.getenv("SDL_FBDEV", "/dev/fb0")
+FPS       = 5   # renders per second — low is fine, saves CPU
 
 BTN_REFRESH   = 17
 BTN_UNUSED_2  = 22
@@ -42,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Palette ───────────────────────────────────────────────────────────────────
+# ── Palette (R,G,B) ───────────────────────────────────────────────────────────
 BG          = (10,  10,  18)
 CARD_BG     = (18,  20,  32)
 CARD_BORDER = (38,  42,  66)
@@ -54,20 +56,58 @@ WARN        = (225, 175,  45)
 ERR         = (215,  65,  65)
 BLUE        = (50,  115, 200)
 SEP         = (32,  36,  54)
-HINT        = (55,   60,  90)
+HINT        = (85,   90, 120)
+
+# ── Framebuffer writer ────────────────────────────────────────────────────────
+
+def get_fb_info():
+    """Return (bits_per_pixel, is_bgr) by reading /sys."""
+    try:
+        bpp = int(open("/sys/class/graphics/fb0/bits_per_pixel").read().strip())
+    except Exception:
+        bpp = 16
+    # Most PiTFT ILI9340 setups use RGB565 (not BGR)
+    return bpp
+
+def image_to_fb(img: Image.Image, fb_path: str, bpp: int):
+    """Write a PIL Image to the framebuffer."""
+    if bpp == 32:
+        raw = img.convert("RGBA").tobytes()
+    else:
+        # RGB565
+        rgb = img.convert("RGB")
+        pixels = list(rgb.getdata())
+        buf = bytearray(len(pixels) * 2)
+        for i, (r, g, b) in enumerate(pixels):
+            val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            struct.pack_into("<H", buf, i * 2, val)
+        raw = bytes(buf)
+    try:
+        with open(fb_path, "wb") as f:
+            f.write(raw)
+    except Exception as e:
+        log.error(f"FB write error: {e}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def load_font(size, bold=False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono{}.ttf".format("-Bold" if bold else ""),
+        "/usr/share/fonts/truetype/freefont/FreeMono{}.ttf".format("Bold" if bold else ""),
+        "/usr/share/fonts/truetype/liberation/LiberationMono-{}.ttf".format("Bold" if bold else "Regular"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
 def fmt_dollars(v):
     return f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
 
 def fmt_k(v):
-    """Format large integers as e.g. 1.2M or 45K."""
-    if not isinstance(v, (int, float)):
-        return "—"
-    if v >= 1_000_000:
-        return f"{v/1_000_000:.1f}M"
-    if v >= 1_000:
-        return f"{v/1_000:.0f}K"
+    if not isinstance(v, (int, float)): return "—"
+    if v >= 1_000_000: return f"{v/1_000_000:.1f}M"
+    if v >= 1_000:     return f"{v/1_000:.0f}K"
     return str(int(v))
 
 def pct_colour(pct):
@@ -77,12 +117,12 @@ def pct_colour(pct):
 
 def val_colour(v, warn=5.0, err=1.0):
     if not isinstance(v, (int, float)): return ERR
-    if v <= err: return ERR
+    if v <= err:  return ERR
     if v <= warn: return WARN
     return GOOD
 
-
 # ── GPIO ──────────────────────────────────────────────────────────────────────
+
 def setup_gpio():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
@@ -94,39 +134,199 @@ def setup_gpio():
 def cleanup_gpio():
     GPIO.cleanup()
 
+# ── Renderer ──────────────────────────────────────────────────────────────────
+
+class Renderer:
+    def __init__(self):
+        self.f_xl  = load_font(20, bold=True)
+        self.f_lg  = load_font(15, bold=True)
+        self.f_md  = load_font(13)
+        self.f_sm  = load_font(11)
+        self.f_xs  = load_font(10)
+
+    def _txt(self, draw, text, font, colour, x, y, anchor="la"):
+        draw.text((x, y), str(text), font=font, fill=colour, anchor=anchor)
+
+    def _bar(self, draw, x, y, w, h, pct, colour):
+        pct = max(0.0, min(1.0, pct))
+        draw.rectangle([x, y, x+w, y+h], fill=CARD_BORDER)
+        if pct > 0:
+            draw.rectangle([x, y, x+max(2, int(w*pct)), y+h], fill=colour)
+
+    def _card(self, draw, x, y, w, h):
+        draw.rectangle([x, y, x+w, y+h], fill=CARD_BG, outline=CARD_BORDER)
+
+    def render(self, data, last_refresh, refreshing, next_refresh_time) -> Image.Image:
+        img  = Image.new("RGB", (W, H), BG)
+        draw = ImageDraw.Draw(img)
+
+        # ── Header ────────────────────────────────────────────────────────
+        draw.rectangle([0, 0, W, 22], fill=CARD_BG)
+        draw.line([(0, 22), (W, 22)], fill=SEP)
+        self._txt(draw, "API DASHBOARD", self.f_sm, TITLE_COL, 6, 4)
+
+        if refreshing:
+            self._txt(draw, "↻ refreshing", self.f_xs, WARN, W-4, 6, anchor="ra")
+        elif last_refresh:
+            self._txt(draw, last_refresh.strftime("upd %H:%M"), self.f_xs,
+                      LABEL_COL, W-4, 6, anchor="ra")
+
+        # Progress bar
+        elapsed  = next_refresh_time - time.monotonic()
+        bar_pct  = 1.0 - max(0.0, min(elapsed, REFRESH_INTERVAL)) / REFRESH_INTERVAL
+        draw.rectangle([0, 21, max(1, int(W * bar_pct)), 23], fill=BLUE)
+
+        # ── Cards ──────────────────────────────────────────────────────────
+        CARD_Y = 26
+        CARD_H = 198
+        CARD_W = 150
+        self._draw_anthropic(draw,   6, CARD_Y, CARD_W, CARD_H,
+                             data.get("anthropic",  {}))
+        self._draw_elevenlabs(draw, 164, CARD_Y, CARD_W, CARD_H,
+                              data.get("elevenlabs", {}))
+
+        # ── Footer ────────────────────────────────────────────────────────
+        fy = H - 14
+        draw.line([(0, fy-2), (W, fy-2)], fill=SEP)
+        self._txt(draw, "[1] Refresh",   self.f_xs, HINT, 4,   fy)
+        self._txt(draw, "[4] Backlight", self.f_xs, HINT, W-4, fy, anchor="ra")
+
+        return img
+
+    def _draw_anthropic(self, draw, x, y, w, h, d):
+        self._card(draw, x, y, w, h)
+
+        # Header with live key status dot
+        valid = d.get("key_valid")
+        dot_c = GOOD if valid else (ERR if valid is False else LABEL_COL)
+        self._txt(draw, "◈  ANTHROPIC", self.f_sm, TITLE_COL, x+8, y+6)
+        self._txt(draw, "●", self.f_xs, dot_c, x+w-6, y+8, anchor="ra")
+        draw.line([(x+4, y+20), (x+w-4, y+20)], fill=SEP)
+        cy = y + 28
+
+        # Requests remaining — big
+        req_rem = d.get("req_remaining")
+        req_lim = d.get("req_limit")
+        self._txt(draw, "Requests / min", self.f_xs, LABEL_COL, x+8, cy)
+        cy += 13
+        if req_lim:
+            pct = 1.0 - (req_rem or 0) / req_lim
+            c   = pct_colour(pct)
+            self._txt(draw, str(req_rem), self.f_xl, c, x+8, cy)
+            cy += 26
+            self._txt(draw, f"of {req_lim} limit", self.f_xs, LABEL_COL, x+8, cy)
+            cy += 13
+            self._bar(draw, x+8, cy, w-16, 7, pct, c)
+            cy += 14
+            self._txt(draw, f"used {req_lim-(req_rem or 0)} ({pct*100:.0f}%)",
+                      self.f_xs, LABEL_COL, x+8, cy)
+            cy += 16
+        else:
+            self._txt(draw, "—", self.f_xl, LABEL_COL, x+8, cy)
+            cy += 30
+
+        draw.line([(x+4, cy), (x+w-4, cy)], fill=SEP)
+        cy += 6
+
+        # Tokens remaining — big
+        tok_rem = d.get("tok_remaining")
+        tok_lim = d.get("tok_limit")
+        self._txt(draw, "Tokens / min", self.f_xs, LABEL_COL, x+8, cy)
+        cy += 13
+        if tok_lim:
+            pct = 1.0 - (tok_rem or 0) / tok_lim
+            c   = pct_colour(pct)
+            self._txt(draw, fmt_k(tok_rem), self.f_xl, c, x+8, cy)
+            cy += 26
+            self._txt(draw, f"of {fmt_k(tok_lim)} limit", self.f_xs, LABEL_COL, x+8, cy)
+            cy += 13
+            self._bar(draw, x+8, cy, w-16, 7, pct, c)
+            cy += 14
+            self._txt(draw, f"used {fmt_k(tok_lim-(tok_rem or 0))} ({pct*100:.0f}%)",
+                      self.f_xs, LABEL_COL, x+8, cy)
+        else:
+            self._txt(draw, "—", self.f_xl, LABEL_COL, x+8, cy)
+
+        if d.get("error") and not d.get("key_valid"):
+            self._txt(draw, d["error"][:16], self.f_xs, ERR, x+8, y+h-12)
+
+    def _draw_elevenlabs(self, draw, x, y, w, h, d):
+        self._card(draw, x, y, w, h)
+        self._txt(draw, "◎  ELEVENLABS", self.f_sm, TITLE_COL, x+8, y+6)
+        draw.line([(x+4, y+20), (x+w-4, y+20)], fill=SEP)
+        cy = y + 26
+
+        # Status
+        status = d.get("status", "")
+        s_col  = GOOD if status == "active" else (WARN if status else LABEL_COL)
+        self._txt(draw, f"● {status or '—'}", self.f_xs, s_col, x+8, cy)
+        cy += 15
+
+        # Characters
+        used  = d.get("chars_used")
+        limit = d.get("chars_limit")
+        if used is not None and limit and limit > 0:
+            remaining = limit - used
+            pct       = used / limit
+            c         = pct_colour(pct)
+            self._txt(draw, "Characters", self.f_xs, LABEL_COL, x+8, cy)
+            cy += 13
+            self._txt(draw, fmt_k(remaining), self.f_xl, c, x+8, cy)
+            cy += 24
+            self._txt(draw, f"remaining of {fmt_k(limit)}", self.f_xs, LABEL_COL, x+8, cy)
+            cy += 13
+            self._bar(draw, x+8, cy, w-16, 6, pct, c)
+            cy += 12
+            self._txt(draw, f"used {fmt_k(used)} ({pct*100:.0f}%)", self.f_xs,
+                      LABEL_COL, x+8, cy)
+            cy += 15
+        else:
+            self._txt(draw, "Characters", self.f_xs, LABEL_COL, x+8, cy)
+            cy += 13
+            self._txt(draw, "—", self.f_lg, LABEL_COL, x+8, cy)
+            cy += 22
+
+        draw.line([(x+4, cy), (x+w-4, cy)], fill=SEP)
+        cy += 5
+
+        # Plan
+        tier = d.get("tier", "—")
+        self._txt(draw, "Plan", self.f_xs, LABEL_COL, x+8, cy)
+        self._txt(draw, str(tier).capitalize(), self.f_xs, VALUE_COL, x+w-6, cy, anchor="ra")
+        cy += 14
+
+        # Reset
+        reset = d.get("next_reset")
+        self._txt(draw, "Resets", self.f_xs, LABEL_COL, x+8, cy)
+        self._txt(draw, reset or "—", self.f_xs, VALUE_COL, x+w-6, cy, anchor="ra")
+        cy += 14
+
+        # Overage
+        overage = d.get("overage")
+        if overage:
+            cur = d.get("overage_currency", "USD")
+            self._txt(draw, "Overage", self.f_xs, LABEL_COL, x+8, cy)
+            self._txt(draw, f"{fmt_dollars(overage)} {cur}", self.f_xs, WARN,
+                      x+w-6, cy, anchor="ra")
+
+        if d.get("error"):
+            self._txt(draw, d["error"][:16], self.f_xs, ERR, x+8, y+h-12)
+
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
+
 class Dashboard:
     def __init__(self):
-        pygame.init()
+        self.renderer      = Renderer()
+        self.bpp           = get_fb_info()
+        self.data: dict    = {}
+        self.last_refresh  = None
+        self.refreshing    = False
+        self.backlight_on  = True
+        self._next_refresh = 0.0
+        self._lock         = threading.Lock()
+        log.info(f"Framebuffer: {FB_DEV}, {self.bpp}bpp")
 
-        if os.path.exists("/dev/fb1"):
-            os.environ.setdefault("SDL_FBDEV", "/dev/fb1")
-            os.environ.setdefault("SDL_VIDEODRIVER", "fbcon")
-            os.environ.setdefault("SDL_MOUSEDRV", "TSLIB")
-            os.environ.setdefault("SDL_MOUSEDEV", "/dev/input/touchscreen")
-
-        self.screen = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("API Dashboard")
-        pygame.mouse.set_visible(False)
-        self.clock = pygame.time.Clock()
-
-        # Fonts
-        mono = "dejavusansmono"
-        self.f_xl  = pygame.font.SysFont(mono, 22, bold=True)
-        self.f_lg  = pygame.font.SysFont(mono, 17, bold=True)
-        self.f_md  = pygame.font.SysFont(mono, 13)
-        self.f_sm  = pygame.font.SysFont(mono, 11)
-        self.f_xs  = pygame.font.SysFont(mono, 10)
-
-        self.data: dict            = {}
-        self.last_refresh: datetime | None = None
-        self.refreshing            = False
-        self.backlight_on          = True
-        self._next_refresh         = 0.0
-        self._lock                 = threading.Lock()
-
-    # ── Data ──────────────────────────────────────────────────────────────────
     def trigger_refresh(self):
         if self.refreshing:
             return
@@ -138,234 +338,19 @@ class Dashboard:
         try:
             d = fetch_all()
             with self._lock:
-                self.data         = d
+                self.data        = d
                 self.last_refresh = datetime.now()
             log.info("Done.")
         except Exception as e:
             log.error(f"Refresh error: {e}")
         finally:
-            self.refreshing      = False
-            self._next_refresh   = time.monotonic() + REFRESH_INTERVAL
+            self.refreshing    = False
+            self._next_refresh = time.monotonic() + REFRESH_INTERVAL
 
-    # ── Drawing helpers ───────────────────────────────────────────────────────
-    def _txt(self, surf, text, font, colour, x, y, anchor="topleft"):
-        img = font.render(str(text), True, colour)
-        r   = img.get_rect(**{anchor: (x, y)})
-        surf.blit(img, r)
-        return r
-
-    def _bar(self, surf, x, y, w, h, pct, colour):
-        pct = max(0.0, min(1.0, pct))
-        pygame.draw.rect(surf, CARD_BORDER, (x, y, w, h), border_radius=2)
-        if pct > 0:
-            pygame.draw.rect(surf, colour, (x, y, max(2, int(w * pct)), h),
-                             border_radius=2)
-
-    def _card(self, surf, x, y, w, h):
-        pygame.draw.rect(surf, CARD_BG,     (x, y, w, h), border_radius=8)
-        pygame.draw.rect(surf, CARD_BORDER, (x, y, w, h), width=1, border_radius=8)
-
-    def _section(self, surf, x, y, w, label, value, vcolour=None,
-                 sub=None, sub_colour=None):
-        """Draw a label / value pair with optional sub-line. Returns new y."""
-        self._txt(surf, label, self.f_xs, LABEL_COL, x, y)
-        y += 13
-        self._txt(surf, value, self.f_lg, vcolour or VALUE_COL, x, y)
-        y += 20
-        if sub is not None:
-            self._txt(surf, sub, self.f_xs, sub_colour or LABEL_COL, x, y)
-            y += 14
-        return y
-
-    # ── Cards ─────────────────────────────────────────────────────────────────
-    CARD_X  = [6, 164]          # left edges of the two cards
-    CARD_W  = 150
-    CARD_Y  = 26                # top of cards (below header)
-    CARD_H  = 198
-
-    def _draw_anthropic(self, surf, x, y, w, h, d):
-        self._card(surf, x, y, w, h)
-
-        # ── Header ────────────────────────────────────────────────────────
-        self._txt(surf, "◈  ANTHROPIC", self.f_sm, TITLE_COL, x+8, y+6)
-        pygame.draw.line(surf, SEP, (x+4, y+21), (x+w-4, y+21))
-
-        cy = y + 27
-
-        # Key status indicator
-        valid = d.get("key_valid")
-        if valid is True:
-            dot, dot_c = "●", GOOD
-        elif valid is False:
-            dot, dot_c = "●", ERR
-        else:
-            dot, dot_c = "●", LABEL_COL
-        self._txt(surf, dot + " key", self.f_xs, dot_c, x+8, cy)
-        cy += 16
-
-        # Credit balance (static)
-        balance = d.get("credit_balance")
-        cy = self._section(surf, x+8, cy, w-16,
-                           "Credit Balance",
-                           fmt_dollars(balance),
-                           vcolour=val_colour(balance, warn=5.0, err=1.0))
-
-        pygame.draw.line(surf, SEP, (x+4, cy), (x+w-4, cy))
-        cy += 6
-
-        # Rate limits — requests
-        req_rem = d.get("req_remaining")
-        req_lim = d.get("req_limit")
-        if req_lim:
-            pct = 1.0 - (req_rem or 0) / req_lim
-            c   = pct_colour(pct)
-            self._txt(surf, "Req / min", self.f_xs, LABEL_COL, x+8, cy)
-            self._txt(surf, f"{req_rem}/{req_lim}", self.f_xs, c, x+w-8, cy,
-                      anchor="topright")
-            cy += 13
-            self._bar(surf, x+8, cy, w-16, 5, pct, c)
-            cy += 12
-        else:
-            self._txt(surf, "RPM  —", self.f_xs, LABEL_COL, x+8, cy)
-            cy += 18
-
-        # Rate limits — tokens
-        tok_rem = d.get("tok_remaining")
-        tok_lim = d.get("tok_limit")
-        if tok_lim:
-            pct = 1.0 - (tok_rem or 0) / tok_lim
-            c   = pct_colour(pct)
-            self._txt(surf, "Tok / min", self.f_xs, LABEL_COL, x+8, cy)
-            self._txt(surf, f"{fmt_k(tok_rem)}/{fmt_k(tok_lim)}", self.f_xs, c,
-                      x+w-8, cy, anchor="topright")
-            cy += 13
-            self._bar(surf, x+8, cy, w-16, 5, pct, c)
-            cy += 12
-        else:
-            self._txt(surf, "TPM  —", self.f_xs, LABEL_COL, x+8, cy)
-            cy += 18
-
-        # Tier
-        tier = d.get("tier", "—")
-        self._txt(surf, "Tier", self.f_xs, LABEL_COL, x+8, cy)
-        self._txt(surf, str(tier), self.f_xs, VALUE_COL, x+w-8, cy, anchor="topright")
-
-        # Error badge
-        if d.get("error") and not d.get("key_valid"):
-            self._txt(surf, d["error"][:18], self.f_xs, ERR, x+8, y+h-14)
-
-    def _draw_elevenlabs(self, surf, x, y, w, h, d):
-        self._card(surf, x, y, w, h)
-
-        # ── Header ────────────────────────────────────────────────────────
-        self._txt(surf, "◎  ELEVENLABS", self.f_sm, TITLE_COL, x+8, y+6)
-        pygame.draw.line(surf, SEP, (x+4, y+21), (x+w-4, y+21))
-
-        cy = y + 27
-
-        # Status dot
-        status = d.get("status", "")
-        s_col  = GOOD if status == "active" else (WARN if status else LABEL_COL)
-        self._txt(surf, f"● {status or '—'}", self.f_xs, s_col, x+8, cy)
-        cy += 16
-
-        # Character usage
-        used  = d.get("chars_used")
-        limit = d.get("chars_limit")
-
-        if used is not None and limit and limit > 0:
-            remaining = limit - used
-            pct       = used / limit
-            c         = pct_colour(pct)
-
-            self._txt(surf, "Characters", self.f_xs, LABEL_COL, x+8, cy)
-            cy += 13
-            self._txt(surf, fmt_k(remaining), self.f_xl, c, x+8, cy)
-            cy += 26
-            self._txt(surf, f"remaining of {fmt_k(limit)}", self.f_xs,
-                      LABEL_COL, x+8, cy)
-            cy += 13
-            self._bar(surf, x+8, cy, w-16, 7, pct, c)
-            cy += 14
-            self._txt(surf, f"used {fmt_k(used)} ({pct*100:.0f}%)",
-                      self.f_xs, LABEL_COL, x+8, cy)
-            cy += 16
-        else:
-            cy = self._section(surf, x+8, cy, w-16, "Characters", "—")
-
-        pygame.draw.line(surf, SEP, (x+4, cy), (x+w-4, cy))
-        cy += 6
-
-        # Tier
-        tier = d.get("tier", "—")
-        self._txt(surf, "Plan", self.f_xs, LABEL_COL, x+8, cy)
-        self._txt(surf, str(tier).capitalize(), self.f_xs, VALUE_COL,
-                  x+w-8, cy, anchor="topright")
-        cy += 15
-
-        # Reset date
-        reset = d.get("next_reset")
-        self._txt(surf, "Resets", self.f_xs, LABEL_COL, x+8, cy)
-        self._txt(surf, reset or "—", self.f_xs, VALUE_COL,
-                  x+w-8, cy, anchor="topright")
-        cy += 15
-
-        # Overage
-        overage = d.get("overage")
-        if overage:
-            cur = d.get("overage_currency", "USD")
-            self._txt(surf, "Overage", self.f_xs, LABEL_COL, x+8, cy)
-            self._txt(surf, f"{fmt_dollars(overage)} {cur}", self.f_xs, WARN,
-                      x+w-8, cy, anchor="topright")
-
-        if d.get("error"):
-            self._txt(surf, d["error"][:18], self.f_xs, ERR, x+8, y+h-14)
-
-    # ── Main draw ─────────────────────────────────────────────────────────────
-    def draw(self):
-        surf = self.screen
-        surf.fill(BG)
-
-        with self._lock:
-            data         = dict(self.data)
-            last_refresh = self.last_refresh
-            refreshing   = self.refreshing
-
-        # ── Header bar ────────────────────────────────────────────────────
-        pygame.draw.rect(surf, CARD_BG, (0, 0, W, 24))
-        pygame.draw.line(surf, SEP, (0, 24), (W, 24))
-        self._txt(surf, "API DASHBOARD", self.f_sm, TITLE_COL, 6, 5)
-
-        if refreshing:
-            self._txt(surf, "↻ refreshing", self.f_xs, WARN, W-4, 7, anchor="topright")
-        elif last_refresh:
-            self._txt(surf, last_refresh.strftime("upd %H:%M"), self.f_xs,
-                      LABEL_COL, W-4, 7, anchor="topright")
-
-        # Auto-refresh progress bar (fills left→right as next refresh approaches)
-        elapsed  = self._next_refresh - time.monotonic()
-        bar_pct  = 1.0 - max(0.0, min(elapsed, REFRESH_INTERVAL)) / REFRESH_INTERVAL
-        pygame.draw.rect(surf, BLUE, (0, 23, max(1, int(W * bar_pct)), 2))
-
-        # ── Two cards ─────────────────────────────────────────────────────
-        cx, cy, cw, ch = self.CARD_X[0], self.CARD_Y, self.CARD_W, self.CARD_H
-        self._draw_anthropic(surf,  cx,          cy, cw, ch, data.get("anthropic",  {}))
-        self._draw_elevenlabs(surf, self.CARD_X[1], cy, cw, ch, data.get("elevenlabs", {}))
-
-        # ── Footer ────────────────────────────────────────────────────────
-        fy = H - 14
-        pygame.draw.line(surf, SEP, (0, fy-2), (W, fy-2))
-        self._txt(surf, "[1] Refresh", self.f_xs, HINT, 4, fy)
-        self._txt(surf, "[4] Backlight", self.f_xs, HINT, W-4, fy, anchor="topright")
-
-        pygame.display.flip()
-
-    # ── Backlight ─────────────────────────────────────────────────────────────
     def toggle_backlight(self):
         self.backlight_on = not self.backlight_on
         GPIO.output(BACKLIGHT_PIN, GPIO.HIGH if self.backlight_on else GPIO.LOW)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
     def run(self):
         setup_gpio()
         log.info("Starting.")
@@ -374,16 +359,11 @@ class Dashboard:
 
         btn_prev = {BTN_REFRESH: GPIO.HIGH, BTN_BACKLIGHT: GPIO.HIGH}
         DEBOUNCE = 0.05
+        interval = 1.0 / FPS
 
         try:
             while True:
-                for ev in pygame.event.get():
-                    if ev.type == pygame.QUIT:
-                        return
-                    if ev.type == pygame.KEYDOWN:
-                        if ev.key == pygame.K_r: self.trigger_refresh()
-                        if ev.key == pygame.K_q: return
-
+                # Buttons
                 for pin, action in ((BTN_REFRESH, self.trigger_refresh),
                                     (BTN_BACKLIGHT, self.toggle_backlight)):
                     state = GPIO.input(pin)
@@ -394,14 +374,26 @@ class Dashboard:
                             action()
                     btn_prev[pin] = state
 
+                # Auto-refresh
                 if time.monotonic() >= self._next_refresh and not self.refreshing:
                     self.trigger_refresh()
 
-                self.draw()
-                self.clock.tick(FPS)
+                # Render
+                with self._lock:
+                    data         = dict(self.data)
+                    last_refresh = self.last_refresh
+                    refreshing   = self.refreshing
+
+                img = self.renderer.render(data, last_refresh, refreshing,
+                                           self._next_refresh)
+                image_to_fb(img, FB_DEV, self.bpp)
+
+                time.sleep(interval)
+
+        except KeyboardInterrupt:
+            log.info("Exiting.")
         finally:
             cleanup_gpio()
-            pygame.quit()
 
 
 if __name__ == "__main__":

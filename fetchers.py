@@ -67,16 +67,6 @@ def fetch_anthropic() -> dict:
         log.error(f"Anthropic fetch: {e}")
         return {"error": str(e)[:40], "key_valid": False}
 
-    # Static values from .env — updated manually after Console top-ups
-    balance_raw = os.getenv("ANTHROPIC_CREDIT_BALANCE", "").strip()
-    if balance_raw:
-        try:
-            result["credit_balance"] = float(balance_raw)
-        except ValueError:
-            log.warning("ANTHROPIC_CREDIT_BALANCE is not a valid number")
-
-    result["tier"] = os.getenv("ANTHROPIC_TIER", "").strip() or "—"
-
     return result
 
 
